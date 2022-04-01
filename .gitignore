@@ -72,4 +72,8 @@ $RECYCLE.BIN/
 .env
 .envrc
 .python-version
-.iml
+
+# Basic JetBrains files
+*.iml
+*.ipr
+.idea
