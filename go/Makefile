@@ -103,8 +103,8 @@ run:
 	@printf '\n================================================================\n'
 	$(GO_BIN) run ./cmd
 
-.PHONY: docker/fmt
-docker/fmt:
+.PHONY: docker/run
+docker/run:
 	@($(GO_DOCKER_CMD) make $(DOCKER_TARGET_CMD))
 
 .PHONY : build
