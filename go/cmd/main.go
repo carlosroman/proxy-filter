@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
 	"gopkg.in/DataDog/dd-trace-go.v1/profiler"
 
 	"github.com/carlosroman/proxy-filter/go/internal/pkg/server"
@@ -20,6 +21,8 @@ func main() {
 
 	baseEndpoint := flag.String("base-endpoint", "http://127.0.0.1:8080", "The base endpoint which to proxy all requests to")
 	prefix := flag.String("prefix", "", "The metric name prefix filter")
+	env := flag.String("env", "dev", "The environment the proxy filter runs in")
+	statsdAddr := flag.String("stats-addr", "127.0.0.1:8125", "Address for DogStatsD endpoint")
 
 	flag.Parse()
 	conf := server.Config{BaseEndpoint: *baseEndpoint, MetricsPrefixFilter: *prefix}
@@ -37,14 +40,20 @@ func main() {
 		},
 		Timeout: 60 * time.Second,
 	}
-	handler := server.NewHandler(conf, httpClient)
+
+	statsDClient, err := statsd.New(*statsdAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	handler := server.NewHandler(conf, httpClient, statsDClient)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/series", handler.MetricsFilter)
 	mux.HandleFunc("/", handler.ProxyHandle)
 
-	err := profiler.Start(
+	err = profiler.Start(
 		profiler.WithService("proxy-filter-go"),
-		profiler.WithEnv("carlos.roman"),
+		profiler.WithEnv(*env),
 		profiler.WithVersion("0.1.0"),
 		profiler.WithProfileTypes(
 			profiler.CPUProfile,
@@ -61,14 +70,14 @@ func main() {
 		log.Fatal(err)
 	}
 	defer profiler.Stop()
-	httpServer := http.Server{Addr: ":8081", Handler: mux}
 
+	httpServer := &http.Server{Addr: ":8081", Handler: mux}
 	go func(hs *http.Server) {
 		if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Println(fmt.Sprintf("Something went wrong: %v", err))
 			os.Exit(-1)
 		}
-	}(&httpServer)
+	}(httpServer)
 
 	cs := make(chan os.Signal, 1)
 	signal.Notify(cs, os.Interrupt)
