@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/DataDog/datadog-api-client-go/api/v1/datadog"
@@ -65,7 +66,8 @@ func TestHandler_ProxyHandle(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resultChan, ts, h := setupCaptureServer(t, tc.expectedResponse, "")
+			// Given server is running
+			resultChan, ts, h, _ := setupCaptureServer(t, tc.expectedResponse, "")
 			ps := httptest.NewServer(http.HandlerFunc(h.ProxyHandle))
 
 			defer func() {
@@ -73,6 +75,7 @@ func TestHandler_ProxyHandle(t *testing.T) {
 				ps.Close()
 			}()
 
+			// And we create a request
 			expectedPath := "/some/test/path"
 			req, err := http.NewRequest(tc.method, ps.URL+expectedPath, nil)
 			if tc.sentBody != "" {
@@ -90,6 +93,7 @@ func TestHandler_ProxyHandle(t *testing.T) {
 			req.Header.Add("User-Agent", "unit-test")
 			req.Header.Add("DD-API-KEY", "SECRET API KEY")
 
+			// When we make the request
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
 			defer resp.Body.Close()
@@ -97,6 +101,7 @@ func TestHandler_ProxyHandle(t *testing.T) {
 			assert.NotNil(t, resp)
 			assert.Equal(t, 418, resp.StatusCode)
 
+			// Then a request is proxied to test server
 			actual := <-resultChan
 			assert.NotNil(t, actual)
 			assert.Equal(t, expectedPath, actual.path)
@@ -104,6 +109,8 @@ func TestHandler_ProxyHandle(t *testing.T) {
 			assert.Equal(t, "text/test", actual.contentRequestTypeHeader)
 			assert.Equal(t, "SECRET API KEY", actual.apiKey)
 			assert.Equal(t, "unit-test", actual.userAgent)
+
+			// And the payload matches
 			rb, err := io.ReadAll(resp.Body)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expectedResponse, string(rb))
@@ -118,74 +125,20 @@ func TestHandler_ProxyHandle(t *testing.T) {
 	}
 }
 
-func setupCaptureServer(t *testing.T, expectedResponse, metricsPrefixFilter string) (chan result, *httptest.Server, server.Handler) {
-	resultChan := make(chan result, 1)
-	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		res := result{
-			path:                     r.URL.Path,
-			body:                     string(body),
-			contentRequestTypeHeader: r.Header.Get("Content-Type"),
-			method:                   r.Method,
-			apiKey:                   r.Header.Get("DD-API-KEY"),
-			userAgent:                r.Header.Get("User-Agent"),
-			params:                   r.URL.Query(),
-		}
-		defer func(res result) {
-			resultChan <- res
-		}(res)
-		w.Header().Add("Content-Type", "application/test")
-		w.WriteHeader(418)
-		if expectedResponse != "" {
-			_, _ = io.WriteString(w, expectedResponse)
-		}
-	}))
-
-	cfg := server.Config{
-		BaseEndpoint:        ts.URL,
-		MetricsPrefixFilter: metricsPrefixFilter,
-	}
-
-	h := server.NewHandler(cfg, ts.Client())
-
-	return resultChan, ts, h
-}
-
-func defaultMetricsPayload(metricName []string) (payload datadog.MetricsPayload) {
-	payload.Series = make([]datadog.Series, len(metricName))
-	for i := range metricName {
-		payload.Series[i] = datadog.Series{
-			Metric: metricName[i],
-			Type:   datadog.PtrString("gauge"),
-			Points: [][]*float64{
-				{
-					datadog.PtrFloat64(float64(1231231231232)),
-					datadog.PtrFloat64(float64(1)),
-				},
-			},
-			Tags: &[]string{
-				"test:ExampleSubmitmetricsreturnsPayloadacceptedresponse",
-			},
-		}
-	}
-	return
-}
-
-type Compress int64
-
-const (
-	None Compress = iota
-	Gzip
-	Deflate
-)
-
 func TestHandler_MetricsFilter(t *testing.T) {
+	type Compress int64
+	const (
+		None Compress = iota
+		Gzip
+		Deflate
+	)
+
 	tests := []struct {
 		name            string
 		filterPrefix    string
 		payload         datadog.MetricsPayload
 		expectedPayload datadog.MetricsPayload
+		expectedCount   int64
 		compressRequest Compress
 	}{
 		{
@@ -249,7 +202,8 @@ func TestHandler_MetricsFilter(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resultChan, ts, h := setupCaptureServer(t, "/filter/endpoint", tc.filterPrefix)
+			// Given server is running
+			resultChan, ts, h, sc := setupCaptureServer(t, "/filter/endpoint", tc.filterPrefix)
 			ps := httptest.NewServer(http.HandlerFunc(h.MetricsFilter))
 
 			defer func() {
@@ -257,6 +211,7 @@ func TestHandler_MetricsFilter(t *testing.T) {
 				ps.Close()
 			}()
 
+			// And we create a request
 			b := new(bytes.Buffer)
 			var err error
 
@@ -285,6 +240,7 @@ func TestHandler_MetricsFilter(t *testing.T) {
 				req.Header.Add("Content-Encoding", "deflate")
 			}
 
+			// When we make the request
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
 			defer resp.Body.Close()
@@ -292,14 +248,15 @@ func TestHandler_MetricsFilter(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 418, resp.StatusCode, fmt.Sprintf("Got an error: %v", string(respBody)))
 
+			// Then a request is proxied to test server
 			actual := <-resultChan
 			assert.NotNil(t, actual)
 			assert.Equal(t, "POST", actual.method)
 			assert.Equal(t, "application/json", actual.contentRequestTypeHeader)
 			assert.Equal(t, "/filter/endpoint", actual.path)
 
+			// And the payload matches
 			var actualPayload datadog.MetricsPayload
-
 			switch tc.compressRequest {
 			case Gzip:
 				gz, err := gzip.NewReader(strings.NewReader(actual.body))
@@ -316,6 +273,100 @@ func TestHandler_MetricsFilter(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, actualPayload, tc.expectedPayload)
+			value := len(tc.payload.Series) - len(tc.expectedPayload.Series)
+			// called true only if we are going to filter metrics
+			called := tc.filterPrefix != ""
+			sc.assertCount(t, "proxy_filter.filtered_metrics.count", int64(value), []string{"one", "two", "three"}, 1, called)
 		})
 	}
+}
+
+func setupCaptureServer(t *testing.T, expectedResponse, metricsPrefixFilter string) (chan result, *httptest.Server, server.Handler, *stubStatsdClient) {
+	resultChan := make(chan result, 1)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		res := result{
+			path:                     r.URL.Path,
+			body:                     string(body),
+			contentRequestTypeHeader: r.Header.Get("Content-Type"),
+			method:                   r.Method,
+			apiKey:                   r.Header.Get("DD-API-KEY"),
+			userAgent:                r.Header.Get("User-Agent"),
+			params:                   r.URL.Query(),
+		}
+		defer func(res result) {
+			resultChan <- res
+		}(res)
+		w.Header().Add("Content-Type", "application/test")
+		w.WriteHeader(418)
+		if expectedResponse != "" {
+			_, _ = io.WriteString(w, expectedResponse)
+		}
+	}))
+
+	cfg := server.Config{
+		BaseEndpoint:        ts.URL,
+		MetricsPrefixFilter: metricsPrefixFilter,
+		Tags:                []string{"one", "two", "three"},
+	}
+
+	sd := &stubStatsdClient{}
+	h := server.NewHandler(cfg, ts.Client(), sd)
+
+	return resultChan, ts, h, sd
+}
+
+type stubStatsdClient struct {
+	name   string
+	value  int64
+	tags   []string
+	rate   float64
+	called bool
+	sync.Mutex
+}
+
+func (s *stubStatsdClient) Count(name string, value int64, tags []string, rate float64) (err error) {
+	s.Lock()
+	defer s.Unlock()
+	s.name = name
+	s.value = value
+	s.tags = tags
+	s.rate = rate
+	s.called = true
+	return
+}
+
+func (s *stubStatsdClient) assertCount(t *testing.T, name string, value int64, tags []string, rate float64, called bool) {
+	s.Lock()
+	defer s.Unlock()
+	if !called {
+		require.False(t, called)
+		return
+	}
+	require.True(t, s.called)
+	assert.Equal(t, name, s.name)
+	assert.Equal(t, tags, s.tags)
+	assert.Equal(t, rate, s.rate)
+	assert.Equal(t, value, s.value)
+}
+
+func defaultMetricsPayload(metricName []string) (payload datadog.MetricsPayload) {
+	payload.Series = make([]datadog.Series, len(metricName))
+	for i := range metricName {
+		payload.Series[i] = datadog.Series{
+			Metric: metricName[i],
+			Type:   datadog.PtrString("gauge"),
+			Points: [][]*float64{
+				{
+					datadog.PtrFloat64(float64(1231231231232)),
+					datadog.PtrFloat64(float64(1)),
+				},
+			},
+			Tags: &[]string{
+				"test:ExampleSubmitmetricsreturnsPayloadacceptedresponse",
+			},
+		}
+	}
+	return
 }

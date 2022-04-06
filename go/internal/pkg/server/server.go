@@ -13,18 +13,24 @@ import (
 	"github.com/DataDog/datadog-api-client-go/api/v1/datadog"
 )
 
+const (
+	metricsFilteredCountName = "proxy_filter.filtered_metrics.count"
+)
+
 type Config struct {
 	BaseEndpoint        string
 	MetricsPrefixFilter string
+	Tags                []string
 }
 
-func NewHandler(cfg Config, httpClient *http.Client) Handler {
-	return Handler{cfg: cfg, httpClient: httpClient}
+func NewHandler(cfg Config, httpClient *http.Client, statsDClient statsdClient) Handler {
+	return Handler{cfg: cfg, httpClient: httpClient, statsDClient: statsDClient}
 }
 
 type Handler struct {
-	cfg        Config
-	httpClient *http.Client
+	cfg          Config
+	httpClient   *http.Client
+	statsDClient statsdClient
 }
 
 func (h *Handler) ProxyHandle(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +43,7 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, body)
 	req.URL.RawQuery = r.URL.RawQuery
 	if err != nil {
+		fmt.Println(fmt.Sprintf("Got an error creating new request, %v", err))
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -48,8 +55,8 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		fmt.Println(fmt.Sprintf("Got an error doing http request, %v", err))
 		w.WriteHeader(http.StatusBadGateway)
-		fmt.Println(err)
 		return
 	}
 
@@ -59,7 +66,7 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
-	//fmt.Println(fmt.Sprintf("Sent request to %s with Content-Encoding %s, got %d", url, r.Header.Get("Content-Encoding"), resp.StatusCode))
+	fmt.Println(fmt.Sprintf("Sent request to %s with Content-Encoding %s, got %d", url, r.Header.Get("Content-Encoding"), resp.StatusCode))
 }
 
 func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +108,7 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 			filteredSeries = append(filteredSeries, payload.Series[i])
 		}
 	}
+	_ = h.statsDClient.Count(metricsFilteredCountName, int64(len(payload.Series)-len(filteredSeries)), h.cfg.Tags, 1)
 	payload.SetSeries(filteredSeries)
 
 	buf := new(bytes.Buffer)
@@ -132,4 +140,8 @@ type nopWriterCloser struct {
 
 func (n *nopWriterCloser) Close() error {
 	return nil
+}
+
+type statsdClient interface {
+	Count(name string, value int64, tags []string, rate float64) error
 }
