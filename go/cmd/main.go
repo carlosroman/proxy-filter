@@ -23,6 +23,7 @@ func main() {
 	prefix := flag.String("prefix", "", "The metric name prefix filter")
 	env := flag.String("env", "dev", "The environment the proxy filter runs in")
 	statsdAddr := flag.String("stats-addr", "127.0.0.1:8125", "Address for DogStatsD endpoint")
+	listenAddr := flag.String("listen-addr", ":8081", "Address for proxy to listen on")
 
 	flag.Parse()
 	conf := server.Config{BaseEndpoint: *baseEndpoint, MetricsPrefixFilter: *prefix}
@@ -71,7 +72,7 @@ func main() {
 	}
 	defer profiler.Stop()
 
-	httpServer := &http.Server{Addr: ":8081", Handler: mux}
+	httpServer := &http.Server{Addr: *listenAddr, Handler: mux}
 	go func(hs *http.Server) {
 		if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Println(fmt.Sprintf("Something went wrong: %v", err))
