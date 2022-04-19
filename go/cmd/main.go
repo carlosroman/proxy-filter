@@ -23,6 +23,8 @@ func main() {
 	env := flag.String("env", "dev", "The environment the proxy filter runs in")
 	statsdAddr := flag.String("stats-addr", "127.0.0.1:8125", "Address for DogStatsD endpoint")
 	listenAddr := flag.String("listen-addr", ":8081", "Address for proxy to listen on")
+	enableProtobufFilter := flag.Bool("protobuf-filter", true, "Enable filtering of protobuf payloads")
+	enableJsonFilter := flag.Bool("json-filter", true, "Enable filtering of json payloads")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -50,7 +52,15 @@ func main() {
 
 	handler := server.NewHandler(conf, httpClient, statsDClient)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/series", handler.MetricsFilter)
+
+	if *enableJsonFilter {
+		mux.HandleFunc("/api/v1/series", handler.MetricsFilter)
+	}
+
+	if *enableProtobufFilter {
+		mux.HandleFunc("/api/v2/series", handler.MetricsProtobufFilter)
+	}
+
 	mux.HandleFunc("/", handler.ProxyHandle)
 
 	err = profiler.Start(

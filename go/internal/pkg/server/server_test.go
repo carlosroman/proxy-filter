@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	agentpayload "github.com/DataDog/agent-payload/v5/gogen"
 	"github.com/DataDog/datadog-api-client-go/api/v1/datadog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -125,7 +126,178 @@ func TestHandler_ProxyHandle(t *testing.T) {
 	}
 }
 
-func TestHandler_MetricsFilter(t *testing.T) {
+func TestHandler_MetricsProtobufFilter(t *testing.T) {
+	type Compress int64
+	const (
+		None Compress = iota
+		Gzip
+		Deflate
+	)
+
+	tests := []struct {
+		name            string
+		filterPrefix    string
+		payload         agentpayload.MetricPayload
+		expectedPayload agentpayload.MetricPayload
+		expectedCount   int64
+		compressRequest Compress
+	}{
+		{
+			name:            "Filter nothing",
+			payload:         getTestSeriesMetric([]string{"metric.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.one", "metric.two"}),
+		},
+		{
+			name:            "Filter no matches",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.one", "metric.two"}),
+		},
+		{
+			name:            "Filter metrics",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.one", "some.metric.load", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.one", "metric.two"}),
+		},
+		{
+			name:            "Filter nothing gzip",
+			payload:         getTestSeriesMetric([]string{"metric.gzip.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.gzip.one", "metric.two"}),
+			compressRequest: Gzip,
+		},
+		{
+			name:            "Filter no matches gzip",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.gzip.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.gzip.one", "metric.two"}),
+			compressRequest: Gzip,
+		},
+		{
+			name:            "Filter metrics gzip",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.gzip.one", "some.metric.load", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.gzip.one", "metric.two"}),
+			compressRequest: Gzip,
+		},
+		{
+			name:            "Filter nothing deflate",
+			payload:         getTestSeriesMetric([]string{"metric.deflate.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.deflate.one", "metric.two"}),
+			compressRequest: Deflate,
+		},
+		{
+			name:            "Filter no matches deflate",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.deflate.one", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.deflate.one", "metric.two"}),
+			compressRequest: Deflate,
+		},
+		{
+			name:            "Filter metrics deflate",
+			filterPrefix:    "some.metric",
+			payload:         getTestSeriesMetric([]string{"metric.deflate.one", "some.metric.load", "metric.two"}),
+			expectedPayload: getTestSeriesMetric([]string{"metric.deflate.one", "metric.two"}),
+			compressRequest: Deflate,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given server is running
+			resultChan, ts, h, sc := setupCaptureServer(t, "/filter/endpoint", tc.filterPrefix)
+			ps := httptest.NewServer(http.HandlerFunc(h.MetricsProtobufFilter))
+
+			defer func() {
+				ts.Close()
+				ps.Close()
+			}()
+
+			// And we create a request
+			b := new(bytes.Buffer)
+			var err error
+
+			switch tc.compressRequest {
+			case Gzip:
+				var bs []byte
+				bs, err = tc.payload.Marshal()
+				require.NoError(t, err)
+				gz := gzip.NewWriter(b)
+				_, err = gz.Write(bs)
+				_ = gz.Close()
+			case Deflate:
+				var bs []byte
+				bs, err = tc.payload.Marshal()
+				require.NoError(t, err)
+				gz := zlib.NewWriter(b)
+				_, err = gz.Write(bs)
+				_ = gz.Close()
+			default:
+				var bs []byte
+				bs, err = tc.payload.Marshal()
+				require.NoError(t, err)
+				_, err = b.Write(bs)
+			}
+			require.NoError(t, err)
+
+			req, err := http.NewRequest("POST", ps.URL+"/filter/endpoint", b)
+			require.NoError(t, err)
+			req.Header.Add("Content-Type", "application/x-protobuf")
+
+			switch tc.compressRequest {
+			case Gzip:
+				req.Header.Add("Content-Encoding", "gzip")
+			case Deflate:
+				req.Header.Add("Content-Encoding", "deflate")
+			}
+
+			// When we make the request
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			respBody, err := ioutil.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, 418, resp.StatusCode, fmt.Sprintf("Got an error: %v", string(respBody)))
+
+			// Then a request is proxied to test server
+			actual := <-resultChan
+			assert.NotNil(t, actual)
+			assert.Equal(t, "POST", actual.method)
+			assert.Equal(t, "application/x-protobuf", actual.contentRequestTypeHeader)
+			assert.Equal(t, "/filter/endpoint", actual.path)
+
+			// And the payload matches
+			var actualPayload agentpayload.MetricPayload
+			var all []byte
+			var rc io.ReadCloser
+			switch tc.compressRequest {
+			case Gzip:
+				rc, err = gzip.NewReader(strings.NewReader(actual.body))
+				require.NoError(t, err)
+				all, err = io.ReadAll(rc)
+				require.NoError(t, err)
+				err = actualPayload.Unmarshal(all)
+			case Deflate:
+				rc, err = zlib.NewReader(strings.NewReader(actual.body))
+				require.NoError(t, err)
+				all, err = io.ReadAll(rc)
+				require.NoError(t, err)
+				err = actualPayload.Unmarshal(all)
+			default:
+				err = actualPayload.Unmarshal([]byte(actual.body))
+			}
+
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.expectedPayload, actualPayload)
+			value := len(tc.payload.Series) - len(tc.expectedPayload.Series)
+			// called true only if we are going to filter metrics
+			called := tc.filterPrefix != ""
+			sc.assertCount(t, "proxy_filter.filtered_metrics.count", int64(value), []string{"one", "two", "three"}, 1, called)
+		})
+	}
+}
+
+func TestHandler_MetricsJsonFilter(t *testing.T) {
 	type Compress int64
 	const (
 		None Compress = iota
@@ -257,15 +429,16 @@ func TestHandler_MetricsFilter(t *testing.T) {
 
 			// And the payload matches
 			var actualPayload datadog.MetricsPayload
+			var rc io.ReadCloser
 			switch tc.compressRequest {
 			case Gzip:
-				gz, err := gzip.NewReader(strings.NewReader(actual.body))
+				rc, err = gzip.NewReader(strings.NewReader(actual.body))
 				require.NoError(t, err)
-				err = json.NewDecoder(gz).Decode(&actualPayload)
+				err = json.NewDecoder(rc).Decode(&actualPayload)
 			case Deflate:
-				gz, err := zlib.NewReader(strings.NewReader(actual.body))
+				rc, err = zlib.NewReader(strings.NewReader(actual.body))
 				require.NoError(t, err)
-				err = json.NewDecoder(gz).Decode(&actualPayload)
+				err = json.NewDecoder(rc).Decode(&actualPayload)
 			default:
 				err = json.Unmarshal([]byte(actual.body), &actualPayload)
 			}
@@ -368,5 +541,35 @@ func defaultMetricsPayload(metricName []string) (payload datadog.MetricsPayload)
 			},
 		}
 	}
+	return
+}
+
+func getTestSeriesMetric(metricName []string) (m agentpayload.MetricPayload) {
+	s := make([]*agentpayload.MetricPayload_MetricSeries, len(metricName))
+	for i := range metricName {
+		s[i] = &agentpayload.MetricPayload_MetricSeries{
+			Resources: []*agentpayload.MetricPayload_Resource{
+				{
+					Type: "resource_type",
+					Name: "resource_name",
+				},
+			},
+			Metric: metricName[i],
+			Tags: []string{
+				"test:ExampleSubmitmetricsreturnsPayloadacceptedresponse",
+			},
+			Points: []*agentpayload.MetricPayload_MetricPoint{
+				{
+					Value:     1231231231232,
+					Timestamp: 1,
+				},
+			},
+			Type:           agentpayload.MetricPayload_GAUGE,
+			Unit:           "unit",
+			SourceTypeName: "source_type",
+			Interval:       101,
+		}
+	}
+	m = agentpayload.MetricPayload{Series: s}
 	return
 }
