@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 
+	"k8s.io/klog/v2"
+
 	"github.com/DataDog/datadog-api-client-go/api/v1/datadog"
 )
 
@@ -43,7 +45,7 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, body)
 	req.URL.RawQuery = r.URL.RawQuery
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Got an error creating new request, %v", err))
+		klog.ErrorS(err, "Got an error creating new request")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -55,7 +57,7 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Got an error doing http request, %v", err))
+		klog.ErrorS(err, "Got an error doing http request")
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
@@ -66,7 +68,13 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
-	fmt.Println(fmt.Sprintf("Sent request to %s with Content-Encoding %s, got %d", url, r.Header.Get("Content-Encoding"), resp.StatusCode))
+	klog.InfoS("Request handled",
+		"url", url,
+		"Content-Encoding", r.Header.Get("Content-Encoding"),
+		"Content-Type", r.Header.Get("Content-Type"),
+		"Method", r.Method,
+		"StatusCode", resp.StatusCode,
+	)
 }
 
 func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +95,7 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not read body, %v", err))
+		klog.ErrorS(err, "Could not read body")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -96,7 +104,7 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 	err = json.NewDecoder(rc).Decode(&payload)
 	_ = rc.Close()
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not decode json, %v", err))
+		klog.ErrorS(err, "Could not decode json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -126,7 +134,7 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 	_ = rw.Close()
 
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not endode json, %v", err))
+		klog.ErrorS(err, "Could not encode json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return

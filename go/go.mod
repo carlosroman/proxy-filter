@@ -7,12 +7,14 @@ require (
 	github.com/DataDog/datadog-go/v5 v5.1.0
 	github.com/stretchr/testify v1.7.1
 	gopkg.in/DataDog/dd-trace-go.v1 v1.37.1
+	k8s.io/klog/v2 v2.60.1
 )
 
 require (
 	github.com/DataDog/gostackparse v0.5.0 // indirect
 	github.com/Microsoft/go-winio v0.5.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/pprof v0.0.0-20210423192551-a2663126120b // indirect
 	github.com/google/uuid v1.3.0 // indirect
