@@ -118,3 +118,7 @@ docker/build/example:
 .PHONY: debug
 debug:
 	@(echo '$(GO_DOCKER_CMD)')
+
+.PHONY: lint
+lint:
+	@(docker run --rm -v $(CURDIR):/app -w /app golangci/golangci-lint:v1.45.2 golangci-lint run -v)

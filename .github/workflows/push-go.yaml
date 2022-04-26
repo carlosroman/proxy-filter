@@ -26,3 +26,6 @@ jobs:
       - name: Build example app
         run: make build
         working-directory: go
+      - name: Lint example app
+        run: make lint
+        working-directory: go
