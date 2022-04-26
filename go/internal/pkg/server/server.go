@@ -7,14 +7,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/DataDog/datadog-api-client-go/api/v1/datadog"
+	"github.com/richardartoul/molecule"
+	"github.com/richardartoul/molecule/src/codec"
+	"k8s.io/klog/v2"
 )
 
 const (
 	metricsFilteredCountName = "proxy_filter.filtered_metrics.count"
+	maxHTTPResponseReadBytes = 64 * 1024
+
+	encodingGzip    = "gzip"
+	encodingDeflate = "deflate"
+
+	// constants for the protobuf data we will be filtering, taken from MetricPayload in
+	// https://github.com/DataDog/agent-payload/blob/master/proto/metrics/agent_payload.proto
+	metricSeries           = 1
+	metricSeriesMetricName = 2
 )
 
 type Config struct {
@@ -43,7 +56,7 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, body)
 	req.URL.RawQuery = r.URL.RawQuery
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Got an error creating new request, %v", err))
+		klog.ErrorS(err, "Got an error creating new request")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -55,18 +68,104 @@ func (h *Handler) proxyRequest(w http.ResponseWriter, r *http.Request, body io.R
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Got an error doing http request, %v", err))
+		klog.ErrorS(err, "Got an error doing http request")
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		// Discard any remaining response body when we are done reading.
+		_, _ = io.CopyN(ioutil.Discard, resp.Body, maxHTTPResponseReadBytes)
+		_ = resp.Body.Close()
+	}()
+
 	for key := range resp.Header {
 		w.Header().Add(key, resp.Header.Get(key))
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
-	fmt.Println(fmt.Sprintf("Sent request to %s with Content-Encoding %s, got %d", url, r.Header.Get("Content-Encoding"), resp.StatusCode))
+	klog.InfoS("Request handled",
+		"url", url,
+		"request_content_length", r.ContentLength,
+		"content_length", r.Header.Get("Content-Encoding"),
+		"content_type", r.Header.Get("Content-Type"),
+		"method", r.Method,
+		"status_code", resp.StatusCode,
+	)
+}
+
+func (h *Handler) MetricsProtobufFilter(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.MetricsPrefixFilter == "" {
+		h.proxyRequest(w, r, r.Body)
+		return
+	}
+
+	err, rc := getReaderFromRequest(r)
+	if err != nil {
+		logCouldNotReadBodyError(w, err)
+		return
+	}
+
+	all, err := io.ReadAll(rc)
+	if err != nil {
+		logCouldNotBufferBodyError(w, err)
+		return
+	}
+
+	output := bytes.NewBuffer([]byte{})
+	ps := molecule.NewProtoStream(output)
+	buffer := codec.NewBuffer(all)
+	dropCount := int64(0)
+	err = molecule.MessageEach(buffer, func(fieldNum int32, value molecule.Value) (cont bool, err error) {
+		switch fieldNum {
+		case metricSeries:
+			var packedArr []byte
+			packedArr, err = value.AsBytesSafe()
+			if err != nil {
+				return false, err
+			}
+			mBuffer := codec.NewBuffer(packedArr)
+			var metricName string
+			err = molecule.MessageEach(mBuffer, func(fieldNum int32, value molecule.Value) (iCont bool, iErr error) {
+				if fieldNum == metricSeriesMetricName {
+					metricName, iErr = value.AsStringSafe()
+					return false, iErr
+				}
+				return true, nil
+			})
+			if err != nil {
+				return false, err
+			}
+			if !strings.HasPrefix(metricName, h.cfg.MetricsPrefixFilter) {
+				err = ps.Bytes(int(fieldNum), value.Bytes)
+			} else {
+				dropCount++
+			}
+		default:
+			err = ps.Bytes(int(fieldNum), value.Bytes)
+		}
+
+		return err == nil, err
+	})
+	if err != nil {
+		klog.ErrorS(err, "Could not parse protobuf message")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "%v", err)
+		return
+	}
+	h.logDropCount(dropCount, r)
+
+	buf, rw := getWriterForRequest(r)
+	_, err = io.Copy(rw, output)
+	_ = rw.Close()
+
+	if err != nil {
+		klog.ErrorS(err, "Could not encode protobuf")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "%v", err)
+		return
+	}
+	h.proxyRequest(w, r, io.NopCloser(buf))
 }
 
 func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
@@ -74,29 +173,18 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 		h.proxyRequest(w, r, r.Body)
 		return
 	}
-	var payload datadog.MetricsPayload
-	var err error
-	var rc io.ReadCloser
-	switch r.Header.Get("Content-Encoding") {
-	case "gzip":
-		rc, err = gzip.NewReader(r.Body)
-	case "deflate":
-		rc, err = zlib.NewReader(r.Body)
-	default:
-		rc = r.Body
-	}
 
+	err, rc := getReaderFromRequest(r)
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not read body, %v", err))
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = fmt.Fprintf(w, "%v", err)
+		logCouldNotReadBodyError(w, err)
 		return
 	}
 
+	var payload datadog.MetricsPayload
 	err = json.NewDecoder(rc).Decode(&payload)
 	_ = rc.Close()
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not decode json, %v", err))
+		klog.ErrorS(err, "Could not decode json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
@@ -108,30 +196,69 @@ func (h *Handler) MetricsFilter(w http.ResponseWriter, r *http.Request) {
 			filteredSeries = append(filteredSeries, payload.Series[i])
 		}
 	}
-	_ = h.statsDClient.Count(metricsFilteredCountName, int64(len(payload.Series)-len(filteredSeries)), h.cfg.Tags, 1)
+	dropCount := int64(len(payload.Series) - len(filteredSeries))
+	h.logDropCount(dropCount, r)
+
 	payload.SetSeries(filteredSeries)
 
-	buf := new(bytes.Buffer)
-	var rw io.WriteCloser
-	switch r.Header.Get("Content-Encoding") {
-	case "gzip":
-		rw = gzip.NewWriter(buf)
-	case "deflate":
-		rw = zlib.NewWriter(buf)
-	default:
-		rw = &nopWriterCloser{buf}
-	}
-
+	buf, rw := getWriterForRequest(r)
 	err = json.NewEncoder(rw).Encode(payload)
 	_ = rw.Close()
 
 	if err != nil {
-		fmt.Println(fmt.Sprintf("Could not endode json, %v", err))
+		klog.ErrorS(err, "Could not encode json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%v", err)
 		return
 	}
 	h.proxyRequest(w, r, io.NopCloser(buf))
+}
+
+func (h *Handler) logDropCount(dropCount int64, r *http.Request) {
+	klog.InfoS("Parsed Metric",
+		"drop_count", dropCount,
+		"compression", r.Header.Get("Content-Encoding"))
+	_ = h.statsDClient.Count(metricsFilteredCountName, dropCount, h.cfg.Tags, 1)
+}
+
+func logCouldNotReadBodyError(w http.ResponseWriter, err error) {
+	klog.ErrorS(err, "Could not read body")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = fmt.Fprintf(w, "%v", err)
+}
+
+func logCouldNotBufferBodyError(w http.ResponseWriter, err error) {
+	klog.ErrorS(err, "Could not buffer body")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = fmt.Fprintf(w, "%v", err)
+}
+
+func getReaderFromRequest(r *http.Request) (error, io.ReadCloser) {
+	var err error
+	var rc io.ReadCloser
+	switch r.Header.Get("Content-Encoding") {
+	case encodingGzip:
+		rc, err = gzip.NewReader(r.Body)
+	case encodingDeflate:
+		rc, err = zlib.NewReader(r.Body)
+	default:
+		rc = r.Body
+	}
+	return err, rc
+}
+
+func getWriterForRequest(r *http.Request) (*bytes.Buffer, io.WriteCloser) {
+	buf := new(bytes.Buffer)
+	var rw io.WriteCloser
+	switch r.Header.Get("Content-Encoding") {
+	case encodingGzip:
+		rw = gzip.NewWriter(buf)
+	case encodingDeflate:
+		rw = zlib.NewWriter(buf)
+	default:
+		rw = &nopWriterCloser{buf}
+	}
+	return buf, rw
 }
 
 type nopWriterCloser struct {
